@@ -32,22 +32,23 @@ class PdfPageImageModule(reactContext: ReactApplicationContext) :
     }
   }
 
-  override fun generate(uri: String, page: Double, scale: Double, promise: Promise) {
+  override fun generate(uri: String, page: Double, scale: Double, options: ReadableMap, promise: Promise) {
     try {
       val doc = getOrOpen(uri)
-      val result = doc.renderPage(page.toInt(), scale.toFloat())
+      val result = doc.renderPage(page.toInt(), scale.toFloat(), RenderOptions.from(options))
       promise.resolve(result)
     } catch (e: Exception) {
       promise.reject("INTERNAL_ERROR", e.message, e)
     }
   }
 
-  override fun generateAllPages(uri: String, scale: Double, promise: Promise) {
+  override fun generateAllPages(uri: String, scale: Double, options: ReadableMap, promise: Promise) {
     try {
       val doc = getOrOpen(uri)
+      val renderOptions = RenderOptions.from(options)
       val pages = WritableNativeArray()
       for (i in 0 until doc.pageCount) {
-        pages.pushMap(doc.renderPage(i, scale.toFloat()))
+        pages.pushMap(doc.renderPage(i, scale.toFloat(), renderOptions))
       }
       promise.resolve(pages)
     } catch (e: Exception) {
@@ -73,6 +74,34 @@ class PdfPageImageModule(reactContext: ReactApplicationContext) :
   }
 }
 
+// -- RenderOptions: normalized output options --
+
+/**
+ * The JS wrapper always sends all three keys; the fallbacks here only guard
+ * direct native callers.
+ */
+private data class RenderOptions(
+  val format: String,
+  val quality: Int,
+  val maxDimension: Int,
+) {
+  val isPng: Boolean get() = format == "png"
+  val fileExtension: String get() = if (isPng) "png" else "jpg"
+
+  companion object {
+    fun from(map: ReadableMap): RenderOptions {
+      val rawFormat = if (map.hasKey("format")) map.getString("format") else null
+      val rawQuality = if (map.hasKey("quality")) map.getInt("quality") else 80
+      val rawMax = if (map.hasKey("maxDimension")) map.getInt("maxDimension") else 0
+      return RenderOptions(
+        format = if (rawFormat == "png") "png" else "jpeg",
+        quality = rawQuality.coerceIn(1, 100),
+        maxDimension = rawMax.coerceAtLeast(0),
+      )
+    }
+  }
+}
+
 // -- PdfDoc: handles loading, caching, rendering --
 
 private class PdfDoc(
@@ -91,8 +120,8 @@ private class PdfDoc(
 
   val pageCount: Int get() = renderer.pageCount
 
-  fun renderPage(index: Int, scale: Float): WritableNativeMap {
-    val cacheKey = "$index:$scale"
+  fun renderPage(index: Int, scale: Float, options: RenderOptions): WritableNativeMap {
+    val cacheKey = "$index:$scale:${options.format}:${options.quality}:${options.maxDimension}"
     pageCache[cacheKey]?.let {
       // Return a copy since WritableNativeMap can only be consumed once
       val copy = WritableNativeMap()
@@ -107,19 +136,34 @@ private class PdfDoc(
     }
 
     val page = renderer.openPage(index)
-    val width = (page.width * scale).toInt()
-    val height = (page.height * scale).toInt()
+
+    // maxDimension caps the long edge: shrink the effective scale when the
+    // requested scale would exceed it.
+    var effectiveScale = scale
+    val longEdge = maxOf(page.width, page.height)
+    if (options.maxDimension > 0 && longEdge * effectiveScale > options.maxDimension) {
+      effectiveScale = options.maxDimension.toFloat() / longEdge
+    }
+
+    val width = (page.width * effectiveScale).toInt().coerceAtLeast(1)
+    val height = (page.height * effectiveScale).toInt().coerceAtLeast(1)
 
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
+    // White background — also guarantees JPEG (no alpha) loses nothing.
     canvas.drawColor(Color.WHITE)
 
     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
     page.close()
 
-    val outFile = File(context.cacheDir, "${UUID.randomUUID()}.png")
+    val outFile = File(context.cacheDir, "${UUID.randomUUID()}.${options.fileExtension}")
     FileOutputStream(outFile).use { out ->
-      bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+      // JPEG (default) is ~10-20x smaller than PNG for scanned pages.
+      if (options.isPng) {
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+      } else {
+        bitmap.compress(Bitmap.CompressFormat.JPEG, options.quality, out)
+      }
     }
     bitmap.recycle()
     tempFiles.add(outFile)

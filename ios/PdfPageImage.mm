@@ -9,11 +9,13 @@ RCT_EXTERN_METHOD(openPdf:(NSString *)uri
 RCT_EXTERN_METHOD(generate:(NSString *)uri
                   page:(int)page
                   scale:(float)scale
+                  options:(NSDictionary *)options
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
 
 RCT_EXTERN_METHOD(generateAllPages:(NSString *)uri
                   scale:(float)scale
+                  options:(NSDictionary *)options
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
 

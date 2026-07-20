@@ -11,8 +11,29 @@ export type PdfInfo = {
   pageCount: number;
 };
 
+export type PageImageFormat = 'jpeg' | 'png';
+
+export type GenerateOptions = {
+  /** Output encoding. JPEG is ~10–20× smaller for scanned pages. Default: 'jpeg'. */
+  format?: PageImageFormat;
+  /** JPEG quality 1–100 (ignored for PNG). Default: 80. */
+  quality?: number;
+  /**
+   * Cap the output's long edge in pixels — the effective scale is reduced
+   * when scale × page size would exceed it. Ideal for thumbnails without
+   * knowing the page dimensions. 0 (default) = no cap.
+   */
+  maxDimension?: number;
+};
+
 const clampScale = (scale?: number): number =>
   Math.min(10, Math.max(0.1, scale ?? 1.0));
+
+const normalizeOptions = (options?: GenerateOptions) => ({
+  format: options?.format === 'png' ? 'png' : 'jpeg',
+  quality: Math.min(100, Math.max(1, Math.round(options?.quality ?? 80))),
+  maxDimension: Math.max(0, Math.round(options?.maxDimension ?? 0)),
+});
 
 export class PdfPageImage {
   static async open(uri: string): Promise<PdfInfo> {
@@ -23,15 +44,26 @@ export class PdfPageImage {
     uri: string,
     page: number,
     scale?: number,
+    options?: GenerateOptions,
   ): Promise<PageImage> {
-    return NativePdfPageImage.generate(uri, page, clampScale(scale));
+    return NativePdfPageImage.generate(
+      uri,
+      page,
+      clampScale(scale),
+      normalizeOptions(options),
+    );
   }
 
   static async generateAllPages(
     uri: string,
     scale?: number,
+    options?: GenerateOptions,
   ): Promise<PageImage[]> {
-    return NativePdfPageImage.generateAllPages(uri, clampScale(scale));
+    return NativePdfPageImage.generateAllPages(
+      uri,
+      clampScale(scale),
+      normalizeOptions(options),
+    );
   }
 
   static async close(uri: string): Promise<void> {

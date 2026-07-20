@@ -1,8 +1,8 @@
 {
   "name": "@dariyd/react-native-pdf-page-image",
   "title": "React Native PDF Page Image",
-  "version": "1.0.1",
-  "description": "Render PDF pages to PNG images in React Native. Built for New Architecture (TurboModules + Codegen). Uses PDFKit on iOS and PdfRenderer on Android.",
+  "version": "2.0.0",
+  "description": "Render PDF pages to JPEG or PNG images in React Native. Built for New Architecture (TurboModules + Codegen). Uses PDFKit on iOS and PdfRenderer on Android.",
   "main": "index.js",
   "types": "index.d.ts",
   "react-native": "src/index",

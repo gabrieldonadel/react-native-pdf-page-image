@@ -22,11 +22,11 @@ class PdfPageImage: NSObject {
   }
 
   @objc
-  func generate(_ uri: String, page: Int, scale: Float, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+  func generate(_ uri: String, page: Int, scale: Float, options: NSDictionary, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       do {
         let doc = try self?.getOrOpen(uri: uri)
-        let result = try doc?.renderPage(index: page, scale: CGFloat(scale))
+        let result = try doc?.renderPage(index: page, scale: CGFloat(scale), options: RenderOptions(options))
         resolve(result)
       } catch {
         reject("INTERNAL_ERROR", error.localizedDescription, error)
@@ -35,7 +35,7 @@ class PdfPageImage: NSObject {
   }
 
   @objc
-  func generateAllPages(_ uri: String, scale: Float, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+  func generateAllPages(_ uri: String, scale: Float, options: NSDictionary, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       do {
         let doc = try self?.getOrOpen(uri: uri)
@@ -43,9 +43,10 @@ class PdfPageImage: NSObject {
           reject("INTERNAL_ERROR", "Document not available", nil)
           return
         }
+        let renderOptions = RenderOptions(options)
         var pages: [[String: Any]] = []
         for i in 0..<doc.pageCount {
-          let result = try doc.renderPage(index: i, scale: CGFloat(scale))
+          let result = try doc.renderPage(index: i, scale: CGFloat(scale), options: renderOptions)
           pages.append(result)
         }
         resolve(pages)
@@ -72,6 +73,28 @@ class PdfPageImage: NSObject {
   }
 }
 
+// MARK: - RenderOptions
+
+/// Normalized output options (the JS wrapper always sends all three keys;
+/// defaults here only guard direct native callers).
+struct RenderOptions {
+  let format: String
+  let quality: CGFloat
+  let maxDimension: CGFloat
+
+  init(_ dict: NSDictionary) {
+    let rawFormat = dict["format"] as? String
+    format = rawFormat == "png" ? "png" : "jpeg"
+    let rawQuality = (dict["quality"] as? NSNumber)?.doubleValue ?? 80
+    quality = CGFloat(min(100, max(1, rawQuality)))
+    let rawMax = (dict["maxDimension"] as? NSNumber)?.doubleValue ?? 0
+    maxDimension = CGFloat(max(0, rawMax))
+  }
+
+  var isPng: Bool { format == "png" }
+  var fileExtension: String { isPng ? "png" : "jpg" }
+}
+
 // MARK: - PdfDocument (handles loading, caching, rendering)
 
 private class PdfDocument {
@@ -90,8 +113,8 @@ private class PdfDocument {
 
   var pageCount: Int { document.pageCount }
 
-  func renderPage(index: Int, scale: CGFloat) throws -> [String: Any] {
-    let cacheKey = "\(index):\(scale)"
+  func renderPage(index: Int, scale: CGFloat, options: RenderOptions) throws -> [String: Any] {
+    let cacheKey = "\(index):\(scale):\(options.format):\(options.quality):\(options.maxDimension)"
     if let cached = pageCache[cacheKey] { return cached }
 
     guard index >= 0, index < document.pageCount else {
@@ -114,18 +137,31 @@ private class PdfDocument {
       swap(&width, &height)
     }
 
-    let scaledWidth = width * scale
-    let scaledHeight = height * scale
+    // maxDimension caps the long edge: shrink the effective scale when the
+    // requested scale would exceed it.
+    var effectiveScale = scale
+    let longEdge = max(width, height)
+    if options.maxDimension > 0, longEdge * effectiveScale > options.maxDimension {
+      effectiveScale = options.maxDimension / longEdge
+    }
+
+    let scaledWidth = width * effectiveScale
+    let scaledHeight = height * effectiveScale
     let size = CGSize(width: scaledWidth, height: scaledHeight)
 
-    let renderer = UIGraphicsImageRenderer(size: size)
+    // 1 pt == 1 px: the default renderer format multiplies by the device's
+    // screen scale (3x on modern iPhones), silently tripling the output
+    // resolution behind the caller's back.
+    let rendererFormat = UIGraphicsImageRendererFormat.default()
+    rendererFormat.scale = 1
+    let renderer = UIGraphicsImageRenderer(size: size, format: rendererFormat)
     let image = renderer.image { ctx in
       UIColor.white.setFill()
       ctx.fill(CGRect(origin: .zero, size: size))
 
       let context = ctx.cgContext
       context.translateBy(x: 0, y: scaledHeight)
-      context.scaleBy(x: scale, y: -scale)
+      context.scaleBy(x: effectiveScale, y: -effectiveScale)
 
       if rotation == 90 {
         context.translateBy(x: 0, y: -width)
@@ -141,13 +177,21 @@ private class PdfDocument {
       page.draw(with: .mediaBox, to: context)
     }
 
-    guard let pngData = image.pngData() else {
+    // JPEG (default) is ~10-20x smaller than PNG for scanned/photographic
+    // pages; the white fill above guarantees no alpha is lost.
+    let imageData: Data?
+    if options.isPng {
+      imageData = image.pngData()
+    } else {
+      imageData = image.jpegData(compressionQuality: options.quality / 100)
+    }
+    guard let data = imageData else {
       throw NSError(domain: "PdfPageImage", code: 500,
-                    userInfo: [NSLocalizedDescriptionKey: "Could not convert image to PNG format"])
+                    userInfo: [NSLocalizedDescriptionKey: "Could not encode image as \(options.format)"])
     }
 
-    let outputURL = outputFilename()
-    try pngData.write(to: outputURL)
+    let outputURL = outputFilename(fileExtension: options.fileExtension)
+    try data.write(to: outputURL)
     tempFiles.append(outputURL)
 
     let result: [String: Any] = [
@@ -167,9 +211,12 @@ private class PdfDocument {
     tempFiles.removeAll()
   }
 
-  private func outputFilename() -> URL {
-    let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    return dir.appendingPathComponent("\(UUID().uuidString).png")
+  private func outputFilename(fileExtension: String) -> URL {
+    // Temporary directory, NOT Documents: these are scratch files the caller
+    // copies out; writing them to Documents pollutes user-visible storage
+    // (and backups) when close() is never reached.
+    let dir = FileManager.default.temporaryDirectory
+    return dir.appendingPathComponent("\(UUID().uuidString).\(fileExtension)")
   }
 
   // MARK: - URI Loading
